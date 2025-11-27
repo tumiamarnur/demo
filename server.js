@@ -9,8 +9,8 @@ import { getDatabase, ref, update, onValue, set } from 'firebase/database';
 import { firebaseConfig, agents } from './config.js';
 
 // --- CONFIGURATION ---
-const ADMIN_USERNAME = "admin"; 
-const ADMIN_PASSWORD = "password123"; 
+const ADMIN_USERNAME = "bikroy"; 
+const ADMIN_PASSWORD = "bikroy2026@"; 
 const PORT = process.env.PORT || 3000;
 
 // --- SETUP EXPRESS SERVER ---
@@ -49,6 +49,10 @@ const requireAuth = (req, res, next) => {
 
 // --- 3. PROTECTED ROUTES ---
 app.get('/', requireAuth, (req, res) => {
+    // MODIFICATION: Trigger a manual background scan when the user loads the dashboard
+    // We do not await this, so the page loads instantly while the bot scans in the background
+    runOneOffScan().catch(e => console.error("Auto-refresh on load failed:", e.message));
+
     res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
@@ -70,10 +74,10 @@ let selectedAgents = [];
 let currentHourTracker = -1;  
 let sessionStartCounts = {}; 
 let hourlyStartCounts = {};  
-let lastHourCounts = {};     
-let lastAdCounts = {};       
+let lastHourCounts = {};      
+let lastAdCounts = {};        
 let lastActiveTimes = {};    
-let agentPermissions = {};   
+let agentPermissions = {};    
 let agentIdleState = {}; // Tracks if agent is currently marked idle
 let sessionLogs = []; // Stores activity logs
 let lastQueueAlertLevel = 'NORMAL'; // Tracks queue state: 'NORMAL', 'YELLOW', 'RED'
@@ -216,7 +220,7 @@ async function scrapePermissions(page, agentName, agentConfig) {
 
 // --- COMMAND HANDLER (Isolated Tab Version) ---
 async function runOneOffScan() {
-    console.log('⚡ Running One-Off Scan...');
+    console.log('⚡ Running Manual/Auto Scan...');
     
     if (!globalBrowser || !globalBrowser.isConnected()) {
         console.log("⚠️ Browser not ready. Relaunching...");
@@ -228,8 +232,9 @@ async function runOneOffScan() {
     try {
         tempPage = await globalBrowser.newPage();
         const reviewCounts = await scrapeQueues(tempPage);
+        // We only update lastUpdated and reviewCounts here, preserving other data
         await update(ref(db, 'status'), { lastUpdated: Date.now(), reviewCounts });
-        console.log('✅ Manual refresh complete.');
+        console.log('✅ Manual/Reload refresh complete.');
     } catch (e) {
         console.error("Manual Refresh Failed:", e.message);
     } finally {
@@ -315,41 +320,11 @@ async function startBot() {
             const { hour24, label } = getDhakaTime();
             const now = Date.now();
 
-            await update(ref(db, 'status'), { lastUpdated: now, isRunning: isRunning, timeLabel: label, sessionLogs: sessionLogs });
-
-            if (!isRunning) {
-                await new Promise(r => setTimeout(r, 2000)); 
-                continue;
-            }
-
-            // --- HOURLY LOGIC & LOW PERFORMANCE CHECK ---
-            if (currentHourTracker !== hour24) {
-                // If it's not the very first run (where tracker is -1)
-                if (currentHourTracker !== -1) {
-                    for (const name of selectedAgents) {
-                        const currentTotal = lastAdCounts[name] || 0;
-                        const startOfHour = hourlyStartCounts[name] || currentTotal;
-                        const adsLastHour = Math.max(0, currentTotal - startOfHour);
-                        
-                        lastHourCounts[name] = adsLastHour;
-                        hourlyStartCounts[name] = currentTotal;
-
-                        // Check for Low Performance (< 100 ads)
-                        if (adsLastHour < 100) {
-                            addLog(name, `📉 Low Performance: Only ${adsLastHour} ads last hour.`, 'warning');
-                        }
-                    }
-                } else {
-                    // First run initialization
-                    for (const name of selectedAgents) {
-                        const currentTotal = lastAdCounts[name] || 0;
-                        hourlyStartCounts[name] = currentTotal;
-                    }
-                }
-                currentHourTracker = hour24;
-            }
-
-            // Scrape Queues
+            // ====================================================================
+            // SECTION 1: QUEUE MONITORING (RUNS ALWAYS - 24/7)
+            // ====================================================================
+            // We scrape queues every minute regardless of whether Agents are being tracked.
+            
             const reviewCounts = await scrapeQueues(mainPage);
 
             // --- QUEUE MONITORING LOGIC (STATE BASED) ---
@@ -391,96 +366,131 @@ async function startBot() {
                 lastQueueAlertLevel = currentAlertLevel;
             }
 
+            // ====================================================================
+            // SECTION 2: AGENT TRACKING (RUNS ONLY IF STARTED)
+            // ====================================================================
+            
+            let agentData = {}; // Initialize empty. If stopped, this stays empty/stale in DB.
 
-            // Scrape Permissions (Once per minute for the first run, then logic can vary, keeping simplifed here)
-            if (permTimer === 0 || permTimer >= 60) {
-                for (const name of selectedAgents) {
-                    agentPermissions[name] = await scrapePermissions(mainPage, name, agents[name]);
-                }
-                permTimer = 1;
-            } else { permTimer++; }
-
-            // Scrape Agents & Idle Logic
-            const agentData = {};
-            for (const name of selectedAgents) {
-                const config = agents[name];
-                const url = `https://admin.bikroy.com/search/item?submitted=1&search=&event_type_from=&event_type_to=&event_type=&category=&rejection=&location=&admin_user=${config.id}`;
-                try {
-                    await mainPage.goto(url, { waitUntil: 'domcontentloaded' });
-                    const currentTotal = await mainPage.evaluate(() => {
-                        const m = document.body.innerText.match(/of ([\d,]+) results/);
-                        return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
-                    });
-
-                    // Init data if missing
-                    if (sessionStartCounts[name] === undefined) sessionStartCounts[name] = currentTotal;
-                    if (hourlyStartCounts[name] === undefined) hourlyStartCounts[name] = currentTotal;
-                    if (lastAdCounts[name] === undefined) lastAdCounts[name] = currentTotal;
-                    if (lastActiveTimes[name] === undefined) lastActiveTimes[name] = now;
-                    if (!agentIdleState[name]) agentIdleState[name] = { isIdle: false, idleSince: now };
-
-                    // --- IDLE CHECK LOGIC ---
-                    const previousTotal = lastAdCounts[name];
-                    
-                    if (currentTotal > previousTotal) {
-                        // AGENT IS ACTIVE
-                        if (agentIdleState[name].isIdle) {
-                            // Agent RETURNED from idle
-                            const idleStart = agentIdleState[name].idleSince;
-                            const durationMins = Math.floor((now - idleStart) / 60000);
+            if (isRunning) {
+                
+                // --- HOURLY LOGIC & LOW PERFORMANCE CHECK ---
+                if (currentHourTracker !== hour24) {
+                    // If it's not the very first run (where tracker is -1)
+                    if (currentHourTracker !== -1) {
+                        for (const name of selectedAgents) {
+                            const currentTotal = lastAdCounts[name] || 0;
+                            const startOfHour = hourlyStartCounts[name] || currentTotal;
+                            const adsLastHour = Math.max(0, currentTotal - startOfHour);
                             
-                            const startTimeStr = new Date(idleStart).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
-                            const endTimeStr = new Date(now).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
+                            lastHourCounts[name] = adsLastHour;
+                            hourlyStartCounts[name] = currentTotal;
 
-                            addLog(name, `✅ Back after ${durationMins}m idle (${startTimeStr} - ${endTimeStr})`, 'success');
-                            
-                            agentIdleState[name].isIdle = false;
+                            // Check for Low Performance (< 100 ads)
+                            if (adsLastHour < 100) {
+                                addLog(name, `📉 Low Performance: Only ${adsLastHour} ads last hour.`, 'warning');
+                            }
                         }
-                        
-                        lastActiveTimes[name] = now;
-                        agentIdleState[name].idleSince = now; // Reset idle timer
                     } else {
-                        // AGENT IS INACTIVE
-                        const inactiveMs = now - lastActiveTimes[name];
-                        const inactiveMins = Math.floor(inactiveMs / 60000);
-
-                        // Mark as idle if > 15 mins
-                        if (inactiveMins >= 15 && !agentIdleState[name].isIdle) {
-                            agentIdleState[name].isIdle = true;
-                            agentIdleState[name].idleSince = lastActiveTimes[name]; // Set start of idle to last known active time
-                            addLog(name, `⚠️ Is inactive for ${inactiveMins} mins.`, 'alert');
+                        // First run initialization
+                        for (const name of selectedAgents) {
+                            const currentTotal = lastAdCounts[name] || 0;
+                            hourlyStartCounts[name] = currentTotal;
                         }
                     }
-
-                    lastAdCounts[name] = currentTotal;
-
-                    const thisHourAds = Math.max(0, currentTotal - hourlyStartCounts[name]);
-                    const sessionTotal = Math.max(0, currentTotal - sessionStartCounts[name]);
-
-                    agentData[name] = { 
-                        totalAds: currentTotal, 
-                        thisHourAds,
-                        lastHourAds: lastHourCounts[name] || 0,
-                        cumulativeNewAds: sessionTotal,
-                        lastActiveTime: lastActiveTimes[name],
-                        permissions: agentPermissions[name] || "-"
-                    };
-                } catch (e) {
-                    console.error(`Error scraping ${name}:`, e.message);
+                    currentHourTracker = hour24;
                 }
-            }
 
-            // Update Firebase with Logs
+                // Scrape Permissions (Once per minute for the first run, then logic can vary, keeping simplifed here)
+                if (permTimer === 0 || permTimer >= 60) {
+                    for (const name of selectedAgents) {
+                        agentPermissions[name] = await scrapePermissions(mainPage, name, agents[name]);
+                    }
+                    permTimer = 1;
+                } else { permTimer++; }
+
+                // Scrape Agents & Idle Logic
+                for (const name of selectedAgents) {
+                    const config = agents[name];
+                    const url = `https://admin.bikroy.com/search/item?submitted=1&search=&event_type_from=&event_type_to=&event_type=&category=&rejection=&location=&admin_user=${config.id}`;
+                    try {
+                        await mainPage.goto(url, { waitUntil: 'domcontentloaded' });
+                        const currentTotal = await mainPage.evaluate(() => {
+                            const m = document.body.innerText.match(/of ([\d,]+) results/);
+                            return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
+                        });
+
+                        // Init data if missing
+                        if (sessionStartCounts[name] === undefined) sessionStartCounts[name] = currentTotal;
+                        if (hourlyStartCounts[name] === undefined) hourlyStartCounts[name] = currentTotal;
+                        if (lastAdCounts[name] === undefined) lastAdCounts[name] = currentTotal;
+                        if (lastActiveTimes[name] === undefined) lastActiveTimes[name] = now;
+                        if (!agentIdleState[name]) agentIdleState[name] = { isIdle: false, idleSince: now };
+
+                        // --- IDLE CHECK LOGIC ---
+                        const previousTotal = lastAdCounts[name];
+                        
+                        if (currentTotal > previousTotal) {
+                            // AGENT IS ACTIVE
+                            if (agentIdleState[name].isIdle) {
+                                // Agent RETURNED from idle
+                                const idleStart = agentIdleState[name].idleSince;
+                                const durationMins = Math.floor((now - idleStart) / 60000);
+                                
+                                const startTimeStr = new Date(idleStart).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
+                                const endTimeStr = new Date(now).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
+
+                                addLog(name, `✅ Back after ${durationMins}m idle (${startTimeStr} - ${endTimeStr})`, 'success');
+                                
+                                agentIdleState[name].isIdle = false;
+                            }
+                            
+                            lastActiveTimes[name] = now;
+                            agentIdleState[name].idleSince = now; // Reset idle timer
+                        } else {
+                            // AGENT IS INACTIVE
+                            const inactiveMs = now - lastActiveTimes[name];
+                            const inactiveMins = Math.floor(inactiveMs / 60000);
+
+                            // Mark as idle if > 15 mins
+                            if (inactiveMins >= 15 && !agentIdleState[name].isIdle) {
+                                agentIdleState[name].isIdle = true;
+                                agentIdleState[name].idleSince = lastActiveTimes[name]; // Set start of idle to last known active time
+                                addLog(name, `⚠️ Is inactive for ${inactiveMins} mins.`, 'alert');
+                            }
+                        }
+
+                        lastAdCounts[name] = currentTotal;
+
+                        const thisHourAds = Math.max(0, currentTotal - hourlyStartCounts[name]);
+                        const sessionTotal = Math.max(0, currentTotal - sessionStartCounts[name]);
+
+                        agentData[name] = { 
+                            totalAds: currentTotal, 
+                            thisHourAds,
+                            lastHourAds: lastHourCounts[name] || 0,
+                            cumulativeNewAds: sessionTotal,
+                            lastActiveTime: lastActiveTimes[name],
+                            permissions: agentPermissions[name] || "-"
+                        };
+                    } catch (e) {
+                        console.error(`Error scraping ${name}:`, e.message);
+                    }
+                }
+            } // End of isRunning check
+
+            // Update Firebase with Logs (Updated Every Minute regardless of Running state)
             await update(ref(db, 'status'), { 
                 lastUpdated: now, 
-                isRunning: true, 
+                isRunning: isRunning, 
                 timeLabel: label, 
-                agentData: agentData, 
+                agentData: agentData, // Will be empty if not running, or updated if running
                 reviewCounts: reviewCounts,
                 sessionLogs: sessionLogs 
             });
             
             // Wait 60s (Auto refresh)
+            // This waits 60s whether running or not, fulfilling the requirement "refresh queues every 1 minute"
             await new Promise(r => setTimeout(r, 60000));
 
         } catch (fatal) {

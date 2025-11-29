@@ -49,10 +49,7 @@ const requireAuth = (req, res, next) => {
 
 // --- 3. PROTECTED ROUTES ---
 app.get('/', requireAuth, (req, res) => {
-    // MODIFICATION: Trigger a manual background scan when the user loads the dashboard
-    // We do not await this, so the page loads instantly while the bot scans in the background
     runOneOffScan().catch(e => console.error("Auto-refresh on load failed:", e.message));
-
     res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
@@ -69,7 +66,7 @@ app.listen(PORT, () => console.log(`🌍 Server running at http://localhost:${PO
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getDatabase(firebaseApp);
 
-let isRunning = false;        
+let isRunning = false;       
 let selectedAgents = []; 
 let currentHourTracker = -1;  
 let sessionStartCounts = {}; 
@@ -78,12 +75,12 @@ let lastHourCounts = {};
 let lastAdCounts = {};        
 let lastActiveTimes = {};    
 let agentPermissions = {};    
-let agentIdleState = {}; // Tracks if agent is currently marked idle
-let sessionLogs = []; // Stores activity logs
-let lastQueueAlertLevel = 'NORMAL'; // Tracks queue state: 'NORMAL', 'YELLOW', 'RED'
+let agentIdleState = {}; 
+let sessionLogs = []; 
+let lastQueueAlertLevel = 'NORMAL'; 
 
 let globalBrowser = null; 
-let mainPage = null; // Keep one page open
+let mainPage = null; 
 
 function getDhakaTime() {
     const formatter = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Dhaka', hour: 'numeric', hour12: false });
@@ -102,9 +99,7 @@ function getFormattedTime() {
 
 function addLog(agent, msg, type = 'info') {
     const time = getFormattedTime();
-    // Add new log to the top
     sessionLogs.unshift({ time, agent, msg, type });
-    // Keep only last 100 logs to save memory
     if (sessionLogs.length > 100) sessionLogs.pop();
 }
 
@@ -130,7 +125,7 @@ async function launchBrowser() {
     console.log('🚀 Launching Chrome (GUI Mode)...');
     try {
         globalBrowser = await puppeteer.launch({ 
-            headless: false,  // GUI mode
+            headless: false, 
             defaultViewport: null, 
             userDataDir: './user_data', 
             protocolTimeout: 60000, 
@@ -138,7 +133,11 @@ async function launchBrowser() {
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
                 '--start-maximized', 
-                '--disable-notifications'
+                '--disable-notifications',
+                // ADDED: These flags stop Chrome from freezing the tab when it's in the background
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding'
             ]
         });
         return globalBrowser;
@@ -154,26 +153,55 @@ async function checkLogin(page) {
             const cookies = JSON.parse(fs.readFileSync('cookies.json'));
             await page.setCookie(...cookies);
         } catch (e) {
-            console.warn("⚠️ Could not load cookies.json, proceeding with clean session or userDataDir.");
+            console.warn("⚠️ Could not load cookies.json, proceeding with clean session.");
         }
     }
     
     try {
-        await page.goto('https://admin.bikroy.com/search/item', { waitUntil: 'domcontentloaded', timeout: 20000 });
-        if (page.url().includes('login')) {
-            console.error("❌ Session Expired (Redirected to Login) - Please log in manually in the GUI window!");
-        } else {
-            console.log("✅ Logged in successfully.");
-        }
+        // We just check connection here, real navigation happens in scrapeQueues
+        console.log("✅ Browser session initialized.");
     } catch (e) {
         console.warn("⚠️ Login check warning:", e.message);
     }
 }
 
+// --- UPDATED: SCRAPE QUEUES WITH ANTI-IDLE ---
 async function scrapeQueues(page) {
     try {
-        await page.goto('https://admin.bikroy.com/review/email', { waitUntil: 'networkidle2', timeout: 30000 });
+        // 1. Bring tab to front (Crucial for active status)
+        if (page && !page.isClosed()) {
+            try { await page.bringToFront(); } catch(e) {}
+        }
+
+        const targetUrl = 'https://admin.bikroy.com/review/email';
         
+        // 2. Smart Navigation (Reload if there, Goto if not)
+        if (page.url() === targetUrl) {
+            await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+        } else {
+            await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        }
+        
+        // 3. --- ANTI-IDLE MEASURES ---
+        try {
+            // Wiggle the mouse randomly
+            const randX = Math.floor(Math.random() * 500) + 100;
+            const randY = Math.floor(Math.random() * 500) + 100;
+            await page.mouse.move(randX, randY); 
+            await new Promise(r => setTimeout(r, 500)); // Short pause
+            await page.mouse.move(randX + 50, randY + 50);
+
+            // Scroll down and back up
+            await page.evaluate(() => {
+                window.scrollBy(0, 300);
+                setTimeout(() => window.scrollBy(0, -300), 500);
+            });
+        } catch (idleErr) {
+            // Don't crash if mouse move fails, just log warning
+            // console.log("Anti-idle warning:", idleErr.message); 
+        }
+        // -----------------------------
+
         const currentUrl = page.url();
         if (currentUrl.includes('login')) {
             console.error("❌ Session Invalid: Redirected to Login Page.");
@@ -218,23 +246,20 @@ async function scrapePermissions(page, agentName, agentConfig) {
     } catch (e) { return "Error"; }
 }
 
-// --- COMMAND HANDLER (Isolated Tab Version) ---
+// --- COMMAND HANDLER ---
 async function runOneOffScan() {
-    console.log('⚡ Running Manual/Auto Scan...');
+    console.log('⚡ Running Manual Scan...');
     
     if (!globalBrowser || !globalBrowser.isConnected()) {
-        console.log("⚠️ Browser not ready. Relaunching...");
         await launchBrowser();
     }
 
     let tempPage = null;
-
     try {
         tempPage = await globalBrowser.newPage();
         const reviewCounts = await scrapeQueues(tempPage);
-        // We only update lastUpdated and reviewCounts here, preserving other data
         await update(ref(db, 'status'), { lastUpdated: Date.now(), reviewCounts });
-        console.log('✅ Manual/Reload refresh complete.');
+        console.log('✅ Refresh complete.');
     } catch (e) {
         console.error("Manual Refresh Failed:", e.message);
     } finally {
@@ -262,19 +287,17 @@ async function startBot() {
             selectedAgents = cmd.payload && cmd.payload.length > 0 ? cmd.payload : Object.keys(agents);
             
             const now = Date.now();
-            // Reset counters
             sessionStartCounts = {}; hourlyStartCounts = {}; lastHourCounts = {}; lastAdCounts = {}; lastActiveTimes = {}; 
             agentIdleState = {};
-            lastQueueAlertLevel = 'NORMAL'; // Reset alert state
+            lastQueueAlertLevel = 'NORMAL'; 
             
-            // Initialize states
             selectedAgents.forEach(name => {
                 lastActiveTimes[name] = now;
                 agentIdleState[name] = { isIdle: false, idleSince: now };
             });
             
             currentHourTracker = -1; 
-            sessionLogs = []; // Reset logs on new session
+            sessionLogs = []; 
             addLog('SYSTEM', 'Tracking Started', 'info');
             
         } else if (cmd.action === 'stop') {
@@ -288,7 +311,6 @@ async function startBot() {
         } else if (cmd.action === 'clearLogs') {
             console.log('🧹 Logs Cleared');
             sessionLogs = [];
-            // We update firebase immediately to clear UI
              update(ref(db, 'status'), { sessionLogs: [] });
         }
         set(ref(db, 'commands'), null);
@@ -323,15 +345,13 @@ async function startBot() {
             // ====================================================================
             // SECTION 1: QUEUE MONITORING (RUNS ALWAYS - 24/7)
             // ====================================================================
-            // We scrape queues every minute regardless of whether Agents are being tracked.
-            
+            // This now includes Anti-Idle (Mouse move + Scroll)
             const reviewCounts = await scrapeQueues(mainPage);
 
-            // --- QUEUE MONITORING LOGIC (STATE BASED) ---
+            // --- QUEUE ALERT LOGIC ---
             const redQueues = [];
             let yellowWarning = false;
 
-            // Check Red Thresholds
             if ((reviewCounts['member'] || 0) > 20) redQueues.push('M');
             if ((reviewCounts['listing_fee'] || 0) > 20) redQueues.push('L');
             if ((reviewCounts['general'] || 0) > 250) redQueues.push('G');
@@ -340,11 +360,9 @@ async function startBot() {
             if ((reviewCounts['edited'] || 0) > 250) redQueues.push('E');
             if ((reviewCounts['verification'] || 0) > 2000) redQueues.push('V');
 
-            // Check Yellow Thresholds (Only G and E for "Control Portal")
             if (!redQueues.includes('G') && (reviewCounts['general'] || 0) >= 200) yellowWarning = true;
             if (!redQueues.includes('E') && (reviewCounts['edited'] || 0) >= 150) yellowWarning = true;
 
-            // Determine Current Alert Level
             let currentAlertLevel = 'NORMAL';
             if (redQueues.length > 0) {
                 currentAlertLevel = 'RED';
@@ -352,7 +370,6 @@ async function startBot() {
                 currentAlertLevel = 'YELLOW';
             }
 
-            // Check for State Change (Only log if state changed)
             if (currentAlertLevel !== lastQueueAlertLevel) {
                 if (currentAlertLevel === 'RED') {
                     addLog('SYSTEM', `Need to clear ${redQueues.join(', ')}`, 'alert');
@@ -361,8 +378,6 @@ async function startBot() {
                 } else if (currentAlertLevel === 'NORMAL' && lastQueueAlertLevel !== 'NORMAL') {
                     addLog('SYSTEM', 'Queues returned to normal', 'success');
                 }
-                
-                // Update state
                 lastQueueAlertLevel = currentAlertLevel;
             }
 
@@ -370,13 +385,12 @@ async function startBot() {
             // SECTION 2: AGENT TRACKING (RUNS ONLY IF STARTED)
             // ====================================================================
             
-            let agentData = {}; // Initialize empty. If stopped, this stays empty/stale in DB.
+            let agentData = {}; 
 
             if (isRunning) {
                 
-                // --- HOURLY LOGIC & LOW PERFORMANCE CHECK ---
+                // --- HOURLY LOGIC ---
                 if (currentHourTracker !== hour24) {
-                    // If it's not the very first run (where tracker is -1)
                     if (currentHourTracker !== -1) {
                         for (const name of selectedAgents) {
                             const currentTotal = lastAdCounts[name] || 0;
@@ -386,13 +400,11 @@ async function startBot() {
                             lastHourCounts[name] = adsLastHour;
                             hourlyStartCounts[name] = currentTotal;
 
-                            // Check for Low Performance (< 100 ads)
                             if (adsLastHour < 100) {
                                 addLog(name, `📉 Low Performance: Only ${adsLastHour} ads last hour.`, 'warning');
                             }
                         }
                     } else {
-                        // First run initialization
                         for (const name of selectedAgents) {
                             const currentTotal = lastAdCounts[name] || 0;
                             hourlyStartCounts[name] = currentTotal;
@@ -401,7 +413,6 @@ async function startBot() {
                     currentHourTracker = hour24;
                 }
 
-                // Scrape Permissions (Once per minute for the first run, then logic can vary, keeping simplifed here)
                 if (permTimer === 0 || permTimer >= 60) {
                     for (const name of selectedAgents) {
                         agentPermissions[name] = await scrapePermissions(mainPage, name, agents[name]);
@@ -409,7 +420,6 @@ async function startBot() {
                     permTimer = 1;
                 } else { permTimer++; }
 
-                // Scrape Agents & Idle Logic
                 for (const name of selectedAgents) {
                     const config = agents[name];
                     const url = `https://admin.bikroy.com/search/item?submitted=1&search=&event_type_from=&event_type_to=&event_type=&category=&rejection=&location=&admin_user=${config.id}`;
@@ -420,20 +430,17 @@ async function startBot() {
                             return m ? parseInt(m[1].replace(/,/g, ''), 10) : 0;
                         });
 
-                        // Init data if missing
                         if (sessionStartCounts[name] === undefined) sessionStartCounts[name] = currentTotal;
                         if (hourlyStartCounts[name] === undefined) hourlyStartCounts[name] = currentTotal;
                         if (lastAdCounts[name] === undefined) lastAdCounts[name] = currentTotal;
                         if (lastActiveTimes[name] === undefined) lastActiveTimes[name] = now;
                         if (!agentIdleState[name]) agentIdleState[name] = { isIdle: false, idleSince: now };
 
-                        // --- IDLE CHECK LOGIC ---
                         const previousTotal = lastAdCounts[name];
                         
                         if (currentTotal > previousTotal) {
-                            // AGENT IS ACTIVE
+                            // ACTIVE
                             if (agentIdleState[name].isIdle) {
-                                // Agent RETURNED from idle
                                 const idleStart = agentIdleState[name].idleSince;
                                 const durationMins = Math.floor((now - idleStart) / 60000);
                                 
@@ -446,16 +453,15 @@ async function startBot() {
                             }
                             
                             lastActiveTimes[name] = now;
-                            agentIdleState[name].idleSince = now; // Reset idle timer
+                            agentIdleState[name].idleSince = now;
                         } else {
-                            // AGENT IS INACTIVE
+                            // INACTIVE
                             const inactiveMs = now - lastActiveTimes[name];
                             const inactiveMins = Math.floor(inactiveMs / 60000);
 
-                            // Mark as idle if > 15 mins
                             if (inactiveMins >= 15 && !agentIdleState[name].isIdle) {
                                 agentIdleState[name].isIdle = true;
-                                agentIdleState[name].idleSince = lastActiveTimes[name]; // Set start of idle to last known active time
+                                agentIdleState[name].idleSince = lastActiveTimes[name];
                                 addLog(name, `⚠️ Is inactive for ${inactiveMins} mins.`, 'alert');
                             }
                         }
@@ -477,20 +483,19 @@ async function startBot() {
                         console.error(`Error scraping ${name}:`, e.message);
                     }
                 }
-            } // End of isRunning check
+            } 
 
-            // Update Firebase with Logs (Updated Every Minute regardless of Running state)
+            // Update Firebase
             await update(ref(db, 'status'), { 
                 lastUpdated: now, 
                 isRunning: isRunning, 
                 timeLabel: label, 
-                agentData: agentData, // Will be empty if not running, or updated if running
+                agentData: agentData, 
                 reviewCounts: reviewCounts,
                 sessionLogs: sessionLogs 
             });
             
-            // Wait 60s (Auto refresh)
-            // This waits 60s whether running or not, fulfilling the requirement "refresh queues every 1 minute"
+            // Wait 60s
             await new Promise(r => setTimeout(r, 60000));
 
         } catch (fatal) {

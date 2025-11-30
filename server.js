@@ -113,13 +113,8 @@ function formatPermissions(permString) {
 async function launchBrowser() {
     if (globalBrowser && globalBrowser.isConnected()) return globalBrowser;
     
-    // Kill zombie browser if exists
     if (globalBrowser) { 
-        try { 
-            await globalBrowser.close(); 
-        } catch(e) {
-            console.log("⚠️ Could not close previous browser instance:", e.message);
-        } 
+        try { await globalBrowser.close(); } catch(e) {} 
     }
 
     console.log('🚀 Launching Chrome (GUI Mode)...');
@@ -134,7 +129,6 @@ async function launchBrowser() {
                 '--disable-setuid-sandbox',
                 '--start-maximized', 
                 '--disable-notifications',
-                // ADDED: These flags stop Chrome from freezing the tab when it's in the background
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding'
@@ -156,51 +150,57 @@ async function checkLogin(page) {
             console.warn("⚠️ Could not load cookies.json, proceeding with clean session.");
         }
     }
-    
-    try {
-        // We just check connection here, real navigation happens in scrapeQueues
-        console.log("✅ Browser session initialized.");
-    } catch (e) {
-        console.warn("⚠️ Login check warning:", e.message);
-    }
+    console.log("✅ Browser session initialized.");
 }
 
-// --- UPDATED: SCRAPE QUEUES WITH ANTI-IDLE ---
-async function scrapeQueues(page) {
+// --- UPDATED: SCRAPE QUEUES WITH NAVIGATION CYCLE ---
+async function scrapeQueues(page, doKeepAlive = false) {
     try {
-        // 1. Bring tab to front (Crucial for active status)
         if (page && !page.isClosed()) {
             try { await page.bringToFront(); } catch(e) {}
         }
 
-        const targetUrl = 'https://admin.bikroy.com/review/email';
+        const queueUrl = 'https://admin.bikroy.com/review/email';
         
-        // 2. Smart Navigation (Reload if there, Goto if not)
-        if (page.url() === targetUrl) {
+        // --- 1. KEEP ALIVE NAVIGATION (Every 10 mins) ---
+        if (doKeepAlive) {
+            console.log("♻️ Performing Keep-Alive Navigation (Switching Pages)...");
+            try {
+                // Go to a lightweight safe page (Search)
+                await page.goto('https://admin.bikroy.com/search/item', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                // Wait 3 seconds to register the visit
+                await new Promise(r => setTimeout(r, 3000));
+            } catch(e) { 
+                console.log("Keep-alive nav warning:", e.message); 
+            }
+        }
+
+        // --- 2. GO TO QUEUE PAGE ---
+        // If we just navigated away, this will force a fresh load of the queue page
+        if (page.url() === queueUrl && !doKeepAlive) {
             await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
         } else {
-            await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await page.goto(queueUrl, { waitUntil: 'networkidle2', timeout: 30000 });
         }
         
-        // 3. --- ANTI-IDLE MEASURES ---
+        // --- 3. ANTI-IDLE INTERACTIONS ---
         try {
-            // Wiggle the mouse randomly
+            // Wiggle Mouse
             const randX = Math.floor(Math.random() * 500) + 100;
             const randY = Math.floor(Math.random() * 500) + 100;
-            await page.mouse.move(randX, randY); 
-            await new Promise(r => setTimeout(r, 500)); // Short pause
-            await page.mouse.move(randX + 50, randY + 50);
-
-            // Scroll down and back up
+            await page.mouse.move(randX, randY);
+            
+            // Safe Click (Clicking 'body' usually triggers a click event without clicking a button)
+            await page.click('body').catch(() => {}); 
+            
+            // Scroll
             await page.evaluate(() => {
                 window.scrollBy(0, 300);
                 setTimeout(() => window.scrollBy(0, -300), 500);
             });
         } catch (idleErr) {
-            // Don't crash if mouse move fails, just log warning
-            // console.log("Anti-idle warning:", idleErr.message); 
+            // Ignore errors here
         }
-        // -----------------------------
 
         const currentUrl = page.url();
         if (currentUrl.includes('login')) {
@@ -246,14 +246,11 @@ async function scrapePermissions(page, agentName, agentConfig) {
     } catch (e) { return "Error"; }
 }
 
-// --- COMMAND HANDLER ---
 async function runOneOffScan() {
     console.log('⚡ Running Manual Scan...');
-    
     if (!globalBrowser || !globalBrowser.isConnected()) {
         await launchBrowser();
     }
-
     let tempPage = null;
     try {
         tempPage = await globalBrowser.newPage();
@@ -263,9 +260,7 @@ async function runOneOffScan() {
     } catch (e) {
         console.error("Manual Refresh Failed:", e.message);
     } finally {
-        if (tempPage) {
-            try { await tempPage.close(); } catch(e) {}
-        }
+        if (tempPage) { try { await tempPage.close(); } catch(e) {} }
     }
 }
 
@@ -295,7 +290,6 @@ async function startBot() {
                 lastActiveTimes[name] = now;
                 agentIdleState[name] = { isIdle: false, idleSince: now };
             });
-            
             currentHourTracker = -1; 
             sessionLogs = []; 
             addLog('SYSTEM', 'Tracking Started', 'info');
@@ -309,9 +303,8 @@ async function startBot() {
         } else if (cmd.action === 'refresh') {
             runOneOffScan(); 
         } else if (cmd.action === 'clearLogs') {
-            console.log('🧹 Logs Cleared');
             sessionLogs = [];
-             update(ref(db, 'status'), { sessionLogs: [] });
+            update(ref(db, 'status'), { sessionLogs: [] });
         }
         set(ref(db, 'commands'), null);
     });
@@ -323,6 +316,7 @@ async function startBot() {
     } catch (e) { console.error("Initial Page Setup Failed:", e.message); }
 
     let permTimer = 0;
+    let loopCounter = 0; // Tracks how many times we've looped
 
     while (true) {
         try {
@@ -343,15 +337,20 @@ async function startBot() {
             const now = Date.now();
 
             // ====================================================================
-            // SECTION 1: QUEUE MONITORING (RUNS ALWAYS - 24/7)
+            // SECTION 1: QUEUE MONITORING
             // ====================================================================
-            // This now includes Anti-Idle (Mouse move + Scroll)
-            const reviewCounts = await scrapeQueues(mainPage);
+            
+            loopCounter++;
+            
+            // Check if we should do a "Keep Alive" navigation (Every 10 mins approx)
+            // 60s sleep * 10 = 10 mins
+            const doKeepAlive = (loopCounter % 10 === 0);
 
-            // --- QUEUE ALERT LOGIC ---
+            const reviewCounts = await scrapeQueues(mainPage, doKeepAlive);
+
+            // --- QUEUE ALERTS ---
             const redQueues = [];
             let yellowWarning = false;
-
             if ((reviewCounts['member'] || 0) > 20) redQueues.push('M');
             if ((reviewCounts['listing_fee'] || 0) > 20) redQueues.push('L');
             if ((reviewCounts['general'] || 0) > 250) redQueues.push('G');
@@ -359,50 +358,36 @@ async function startBot() {
             if ((reviewCounts['fraud'] || 0) > 70) redQueues.push('FRD');
             if ((reviewCounts['edited'] || 0) > 250) redQueues.push('E');
             if ((reviewCounts['verification'] || 0) > 2000) redQueues.push('V');
-
             if (!redQueues.includes('G') && (reviewCounts['general'] || 0) >= 200) yellowWarning = true;
             if (!redQueues.includes('E') && (reviewCounts['edited'] || 0) >= 150) yellowWarning = true;
 
             let currentAlertLevel = 'NORMAL';
-            if (redQueues.length > 0) {
-                currentAlertLevel = 'RED';
-            } else if (yellowWarning) {
-                currentAlertLevel = 'YELLOW';
-            }
+            if (redQueues.length > 0) currentAlertLevel = 'RED';
+            else if (yellowWarning) currentAlertLevel = 'YELLOW';
 
             if (currentAlertLevel !== lastQueueAlertLevel) {
-                if (currentAlertLevel === 'RED') {
-                    addLog('SYSTEM', `Need to clear ${redQueues.join(', ')}`, 'alert');
-                } else if (currentAlertLevel === 'YELLOW') {
-                    addLog('SYSTEM', 'Need to control the portal', 'warning');
-                } else if (currentAlertLevel === 'NORMAL' && lastQueueAlertLevel !== 'NORMAL') {
-                    addLog('SYSTEM', 'Queues returned to normal', 'success');
-                }
+                if (currentAlertLevel === 'RED') addLog('SYSTEM', `Need to clear ${redQueues.join(', ')}`, 'alert');
+                else if (currentAlertLevel === 'YELLOW') addLog('SYSTEM', 'Need to control the portal', 'warning');
+                else if (currentAlertLevel === 'NORMAL' && lastQueueAlertLevel !== 'NORMAL') addLog('SYSTEM', 'Queues returned to normal', 'success');
                 lastQueueAlertLevel = currentAlertLevel;
             }
 
             // ====================================================================
-            // SECTION 2: AGENT TRACKING (RUNS ONLY IF STARTED)
+            // SECTION 2: AGENT TRACKING
             // ====================================================================
-            
             let agentData = {}; 
 
             if (isRunning) {
-                
-                // --- HOURLY LOGIC ---
+                // Hourly Logic
                 if (currentHourTracker !== hour24) {
                     if (currentHourTracker !== -1) {
                         for (const name of selectedAgents) {
                             const currentTotal = lastAdCounts[name] || 0;
                             const startOfHour = hourlyStartCounts[name] || currentTotal;
                             const adsLastHour = Math.max(0, currentTotal - startOfHour);
-                            
                             lastHourCounts[name] = adsLastHour;
                             hourlyStartCounts[name] = currentTotal;
-
-                            if (adsLastHour < 100) {
-                                addLog(name, `📉 Low Performance: Only ${adsLastHour} ads last hour.`, 'warning');
-                            }
+                            if (adsLastHour < 100) addLog(name, `📉 Low Performance: Only ${adsLastHour} ads last hour.`, 'warning');
                         }
                     } else {
                         for (const name of selectedAgents) {
@@ -437,40 +422,29 @@ async function startBot() {
                         if (!agentIdleState[name]) agentIdleState[name] = { isIdle: false, idleSince: now };
 
                         const previousTotal = lastAdCounts[name];
-                        
                         if (currentTotal > previousTotal) {
-                            // ACTIVE
                             if (agentIdleState[name].isIdle) {
                                 const idleStart = agentIdleState[name].idleSince;
                                 const durationMins = Math.floor((now - idleStart) / 60000);
-                                
                                 const startTimeStr = new Date(idleStart).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
                                 const endTimeStr = new Date(now).toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour: '2-digit', minute:'2-digit' });
-
                                 addLog(name, `✅ Back after ${durationMins}m idle (${startTimeStr} - ${endTimeStr})`, 'success');
-                                
                                 agentIdleState[name].isIdle = false;
                             }
-                            
                             lastActiveTimes[name] = now;
                             agentIdleState[name].idleSince = now;
                         } else {
-                            // INACTIVE
                             const inactiveMs = now - lastActiveTimes[name];
                             const inactiveMins = Math.floor(inactiveMs / 60000);
-
                             if (inactiveMins >= 15 && !agentIdleState[name].isIdle) {
                                 agentIdleState[name].isIdle = true;
                                 agentIdleState[name].idleSince = lastActiveTimes[name];
                                 addLog(name, `⚠️ Is inactive for ${inactiveMins} mins.`, 'alert');
                             }
                         }
-
                         lastAdCounts[name] = currentTotal;
-
                         const thisHourAds = Math.max(0, currentTotal - hourlyStartCounts[name]);
                         const sessionTotal = Math.max(0, currentTotal - sessionStartCounts[name]);
-
                         agentData[name] = { 
                             totalAds: currentTotal, 
                             thisHourAds,
@@ -485,7 +459,6 @@ async function startBot() {
                 }
             } 
 
-            // Update Firebase
             await update(ref(db, 'status'), { 
                 lastUpdated: now, 
                 isRunning: isRunning, 
@@ -495,7 +468,6 @@ async function startBot() {
                 sessionLogs: sessionLogs 
             });
             
-            // Wait 60s
             await new Promise(r => setTimeout(r, 60000));
 
         } catch (fatal) {
